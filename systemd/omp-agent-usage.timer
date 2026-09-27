@@ -1,0 +1,16 @@
+[Unit]
+Description=Refresh the Oh My Pi usage record for the Omarchy agents panel
+
+[Timer]
+# OnActiveSec, not OnBootSec: OnBootSec is measured against the *user
+# manager's* start, which on a desktop is the login session - hours before a
+# timer enabled in ~/.config is first read. By then OnBootSec is already in
+# the past, the timer goes straight to "elapsed", and with no other elapse
+# pending it never runs again. OnActiveSec is measured from this timer's own
+# activation, so the first record always lands shortly after login.
+OnActiveSec=45s
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

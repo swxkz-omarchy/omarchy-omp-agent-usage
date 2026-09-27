@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh the Oh My Pi usage record for the Omarchy agents panel
+Documentation=man:omarchy-agent-usage-update(1)
+
+[Service]
+Type=oneshot
+# The record is the point; the JSON on stdout is only for manual runs.
+StandardOutput=null
+ExecStart=%h/.local/bin/omarchy-agent-usage-omp

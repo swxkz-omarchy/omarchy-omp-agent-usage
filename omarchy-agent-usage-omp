@@ -1,0 +1,352 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Oh My Pi usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:examples=omarchy agent usage-update | omarchy agent usage-update omp
+"""Collect Oh My Pi usage into one display-ready JSON record.
+
+The agents panel only ever reads the JSON this prints. Token counts come from
+the session journals under the omp agent directory: every assistant message
+carries its provider, model, and per-request usage (input, output, cache read,
+cache write), plus a cost ledger that this record does not carry because the
+panel contract has no field for it.
+
+Unlike the Claude and Codex collectors, no provider is filtered out. This is
+the only place omp's own traffic shows up: those two only count sessions that
+ran on their own provider, and openrouter - the provider actually logged in
+here - has no rate-limit endpoint, so it never appears in their scans.
+
+Records are written by the panel's refresh command only for first-party
+collectors in $OMARCHY_PATH/bin, so this script is driven by its own systemd
+user timer and writes the record file itself. The panel picks the file up
+like any other: it watches the usage directory, not the collector list.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import gzip
+import json
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Iterator
+
+AGENT_ID = "omp"
+AGENT_NAME = "Oh My Pi"
+CACHE_FILE = "omp-sessions.json"
+
+
+def config_root() -> Path:
+  override = os.environ.get("PI_CONFIG_DIR")
+  return Path(override).expanduser() if override else Path.home() / ".omp"
+
+
+def sessions_dir() -> Path:
+  """The journal directory, resolved the way omp resolves its own.
+
+  The first candidate that exists wins, so an explicit override beats the
+  layout guesses and a missing profile directory never wins over the default.
+  """
+  explicit = os.environ.get("PI_CODING_AGENT_SESSION_DIR")
+  if explicit:
+    return Path(explicit).expanduser()
+
+  agent_dir = os.environ.get("PI_CODING_AGENT_DIR")
+  if agent_dir:
+    return Path(agent_dir).expanduser() / "sessions"
+
+  root = config_root()
+  profile = os.environ.get("OMP_PROFILE")
+  if profile is None:
+    profile = os.environ.get("PI_PROFILE")
+  if profile:
+    profile_dir = root / "profiles" / profile / "agent" / "sessions"
+    if profile_dir.is_dir():
+      return profile_dir
+
+  return root / "agent" / "sessions"
+
+
+def cache_root() -> Path:
+  root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "omarchy" / "agent-usage"
+  root.mkdir(parents=True, exist_ok=True)
+  return root
+
+
+def usage_dir() -> Path:
+  root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "omarchy" / "agents" / "usage"
+  root.mkdir(parents=True, exist_ok=True)
+  return root
+
+
+def date_string(value: dt.date) -> str:
+  return value.strftime("%Y-%m-%d")
+
+
+def recent_date_strings() -> list[str]:
+  today = dt.datetime.now().date()
+  return [date_string(today - dt.timedelta(days=offset)) for offset in range(6, -1, -1)]
+
+
+def local_date_string() -> str:
+  return date_string(dt.datetime.now().date())
+
+
+def local_date_from_timestamp(value: Any) -> str:
+  if value is None:
+    return local_date_string()
+
+  if isinstance(value, (int, float)):
+    try:
+      seconds = float(value) / 1000.0 if float(value) > 10_000_000_000 else float(value)
+      return date_string(dt.datetime.fromtimestamp(seconds).date())
+    except Exception:
+      return local_date_string()
+
+  raw = str(value).strip()
+  if not raw:
+    return local_date_string()
+
+  # Journal timestamps are ISO-8601 with a trailing Z, which fromisoformat
+  # rejects until the Z becomes an explicit offset.
+  try:
+    parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if parsed.tzinfo is not None:
+      parsed = parsed.astimezone()
+    return date_string(parsed.date())
+  except Exception:
+    return local_date_string()
+
+
+def number(value: Any) -> int:
+  try:
+    n = float(value or 0)
+    return round(n) if n == n else 0
+  except Exception:
+    return 0
+
+
+def usage_token(usage: dict[str, Any], *keys: str) -> int:
+  for key in keys:
+    if key in usage:
+      return number(usage.get(key))
+  return 0
+
+
+def empty_bucket() -> dict[str, int]:
+  return {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "cacheReadInputTokens": 0,
+    "cacheCreationInputTokens": 0,
+  }
+
+
+def journal_files(root: Path) -> Iterator[Path]:
+  if not root.is_dir():
+    return
+  # Archived sessions are gzipped by the session store; skipping them would
+  # silently drop the older half of the all-time totals.
+  for pattern in ("*.jsonl", "*.jsonl.gz"):
+    yield from root.rglob(pattern)
+
+
+def open_journal(path: Path):
+  if path.suffix == ".gz":
+    return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+  return path.open("r", encoding="utf-8", errors="replace")
+
+
+def scan(root: Path) -> dict[str, Any]:
+  today = local_date_string()
+  recent_dates = recent_date_strings()
+  recent = {day: {"date": day, "messageCount": 0} for day in recent_dates}
+
+  sessions: set[str] = set()
+  active_days: set[str] = set()
+  today_sessions: set[str] = set()
+  today_tokens: dict[str, int] = {}
+  usage_by_model: dict[str, dict[str, int]] = {}
+  providers: set[str] = set()
+  seen: set[str] = set()
+  prompts = 0
+  today_prompt_count = 0
+  today_token_total = 0
+
+  for path in journal_files(root):
+    try:
+      with open_journal(path) as handle:
+        for line_number, line in enumerate(handle, 1):
+          # Cheap pre-filter before JSON parsing keeps unrelated lines free.
+          if '"usage"' not in line or '"assistant"' not in line:
+            continue
+          try:
+            entry = json.loads(line)
+            if entry.get("type") != "message":
+              continue
+            message = entry.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+              continue
+            usage = message.get("usage")
+            if not isinstance(usage, dict):
+              continue
+
+            # A resumed or rewinded journal can repeat a turn, so identity is
+            # the entry id, never the line number.
+            unique_key = f"{path}:{entry.get('id') or line_number}"
+            if unique_key in seen:
+              continue
+            seen.add(unique_key)
+
+            input_tokens = usage_token(usage, "input", "inputTokens")
+            output_tokens = usage_token(usage, "output", "outputTokens")
+            cache_read = usage_token(usage, "cacheRead", "cache_read_input_tokens")
+            cache_write = usage_token(usage, "cacheWrite", "cache_creation_input_tokens")
+            total = input_tokens + output_tokens + cache_read + cache_write
+            if total <= 0:
+              # A provider that reports only an aggregate still counts.
+              total = number(usage.get("totalTokens"))
+              if total <= 0:
+                continue
+              input_tokens = total
+              output_tokens = 0
+              cache_read = 0
+              cache_write = 0
+
+            model = str(message.get("model") or entry.get("model") or "unknown")
+            day = local_date_from_timestamp(entry.get("timestamp") or message.get("timestamp"))
+            provider = str(message.get("provider") or "")
+            session_key = str(path)
+          except Exception:
+            continue
+
+          if provider:
+            providers.add(provider)
+          sessions.add(session_key)
+          active_days.add(day)
+          prompts += 1
+
+          bucket = usage_by_model.setdefault(model, empty_bucket())
+          bucket["inputTokens"] += input_tokens
+          bucket["outputTokens"] += output_tokens
+          bucket["cacheReadInputTokens"] += cache_read
+          bucket["cacheCreationInputTokens"] += cache_write
+
+          if day in recent:
+            # recentDays.messageCount is a token total, despite the legacy
+            # name shared with synced snapshots.
+            recent[day]["messageCount"] += total
+          if day == today:
+            today_prompt_count += 1
+            today_sessions.add(session_key)
+            today_token_total += total
+            today_tokens[model] = today_tokens.get(model, 0) + total
+    except OSError as exc:
+      print(f"Ignoring unreadable omp journal {path}: {exc}", file=sys.stderr)
+
+  return {
+    "todayPrompts": today_prompt_count,
+    "todaySessions": len(today_sessions),
+    "todayTotalTokens": today_token_total,
+    "todayTokensByModel": today_tokens,
+    "recentDays": [recent[day] for day in recent_dates],
+    "modelUsage": usage_by_model,
+    "totalPrompts": prompts,
+    "totalSessions": len(sessions),
+    "activeDays": len(active_days),
+    "activeDates": sorted(active_days),
+    # The hero line names the plan; omp has no plan concept, so the providers
+    # actually billed are the closest truthful label.
+    "tierLabel": ", ".join(sorted(providers)),
+  }
+
+
+def read_fresh_json(path: Path, max_age_seconds: float) -> dict[str, Any] | None:
+  if max_age_seconds <= 0 or not path.exists():
+    return None
+  try:
+    if time.time() - path.stat().st_mtime <= max_age_seconds:
+      return json.loads(path.read_text(encoding="utf-8"))
+  except Exception:
+    return None
+  return None
+
+
+def write_json(path: Path, payload: dict[str, Any], mode: int = 0o644) -> None:
+  # A temp name unique to this writer, not derived from the target: the panel
+  # can refresh while a timer run is still writing, and a shared temp path
+  # means the second replace finds the first one's file already moved away.
+  handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+  tmp = Path(tmp_name)
+  try:
+    with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+      handle.write(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n")
+    tmp.chmod(mode)
+    tmp.replace(path)
+  except BaseException:
+    tmp.unlink(missing_ok=True)
+    raise
+
+
+def cached_scan(root: Path, max_age_seconds: float) -> dict[str, Any]:
+  cache_file = cache_root() / CACHE_FILE
+  lock_file = cache_root() / (CACHE_FILE + ".lock")
+
+  cached = read_fresh_json(cache_file, max_age_seconds)
+  if cached is not None:
+    return cached
+
+  with lock_file.open("w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    cached = read_fresh_json(cache_file, max_age_seconds)
+    if cached is not None:
+      return cached
+    stats = scan(root)
+    write_json(cache_file, stats)
+    return stats
+
+
+def build_record(stats: dict[str, Any]) -> dict[str, Any]:
+  return {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+    "ready": number(stats.get("totalPrompts")) > 0,
+    "hasLocalStats": True,
+    # No subscription limits: this is local spend, not an account allowance.
+    "usageStatusText": "",
+    "authHelpText": "",
+    "limits": [],
+    **stats,
+  }
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--force", action="store_true", help="rescan journals, ignoring the cache")
+  parser.add_argument("--limits-only", action="store_true", help="unused; accepted for the shared collector flags")
+  parser.add_argument("--cache-seconds", type=float, default=300)
+  parser.add_argument("--print", dest="print_only", action="store_true", help="print the record without writing it")
+  args = parser.parse_args()
+
+  stats = cached_scan(sessions_dir(), 0 if args.force else args.cache_seconds)
+  payload = build_record(stats)
+
+  # The first-party refresh command only globs $OMARCHY_PATH/bin, so this
+  # collector owns writing its own record; the panel discovers the file.
+  if not args.print_only:
+    # 0600, like the records the first-party refresh command writes: the panel
+    # reads them as this same user and nothing else should.
+    write_json(usage_dir() / f"{AGENT_ID}.json", payload, 0o600)
+
+  print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

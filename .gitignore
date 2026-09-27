@@ -1,0 +1,7 @@
+# Nothing generated belongs in this repo; install.sh and uninstall.sh only
+# write into $HOME. These are here so a stray local run cannot be committed.
+*.tmp
+*.log
+.omarchy-agent-usage-omp.*
+__pycache__/
+.DS_Store
