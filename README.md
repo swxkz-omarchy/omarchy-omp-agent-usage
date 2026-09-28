@@ -13,12 +13,21 @@ The first-party agents panel draws every number from JSON records that
 **its own** provider (`provider == "anthropic"`, native Codex session files, the
 Fireworks billing API). Traffic from any other provider is filtered out, and
 providers without a rate-limit endpoint report no usage at all. Logged into
-omp with an OpenRouter key, the panel therefore shows nothing: no chip, no
-tokens, no days.
+omp against anything outside those two, the panel therefore shows nothing: no
+chip, no tokens, no days.
 
-This adds a fourth record with no provider filter, so omp's own sessions show
-up as tokens by day and tokens by model, with the same input / output / cache
-split on hover that the other chips have.
+This adds a fourth record with **no provider filter and no privileged
+provider** — whatever omp is logged into is counted, native or gateway,
+`anthropic`, `openai-codex`, `google`, `openrouter`, an OpenAI-compatible
+proxy, or anything else — as tokens by day and tokens by model, with the same
+input / output / cache split on hover that the other chips have.
+
+Model rows are keyed per provider. `claude-opus-4-6` from `anthropic` and the
+same model through `openrouter` are two bills against two price sheets, so
+they stay two rows and each is labelled with its provider. A model id only one
+provider wears keeps the short, familiar label. The chip's hero line names the
+provider when there is exactly one and reports a count (`3 providers`) when
+there is not.
 
 ## Install
 
@@ -53,11 +62,24 @@ OMP_USAGE_REFRESH_SECONDS=600 ./install.sh
 | `~/.config/systemd/user/omp-agent-usage.service` | one-shot run |
 | `~/.config/systemd/user/omp-agent-usage.timer` | refresh every 5 min |
 | `~/.local/state/omarchy/agents/usage/omp.json` | the record the panel reads |
-| `~/.cache/omarchy/agent-usage/omp-sessions.json` | scan cache |
+| `~/.cache/omarchy/agent-usage/omp-sessions-<digest>.json` | scan cache, one per session root |
 
 The timer is a **systemd user** unit, so it starts at every login — no
 `--now`, no `crontab`, no root. Its first run lands 45 seconds after login;
 after that every 5 minutes.
+
+## Tests
+
+```bash
+python3 tests/test_record.py
+```
+
+Seven cases over the record contract, no test framework needed. Each builds a
+throwaway session directory and points the collector at it through
+`PI_CODING_AGENT_DIR`, so the suite never reads `~/.omp` and never writes the
+real panel record. They cover the multi-provider split, native `snake_case`
+usage objects, an aggregate-only provider, single-provider labels, rewind
+dedup, day bucketing, and both journal file shapes.
 
 ## Manual use
 
